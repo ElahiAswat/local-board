@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Collaborative Draw (VoLToRR Demo)</title>
+<style>
+  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif}
+  .toolbar{display:flex;gap:8px;align-items:center;padding:8px;background:#f3f3f3;border-bottom:1px solid #ddd;flex-wrap:wrap}
+  .toolbar button{padding:6px 10px;border:1px solid #bbb;background:white;cursor:pointer}
+  .toolbar button.active{background:#0078d4;color:white;border-color:#005a9e}
+  #canvasWrap{position:relative;height:calc(100% - 56px)}
+  canvas{display:block;width:100%;height:100%;touch-action:none;background:white}
+  label{font-size:13px}
+  input[type="file"]{display:none}
+  #status{font-size:12px;color:#444;margin-left:8px}
+  @media (max-width:420px){ .toolbar{padding:6px} }
+</style>
+</head>
+<body>
+  <div class="toolbar" role="toolbar" aria-label="Drawing controls">
+    <button id="penBtn" class="active">Pen</button>
+    <button id="pixelEraseBtn">Eraser (Pixel)</button>
+    <button id="strokeEraseBtn">Eraser (Stroke)</button>
+    <label>Color <input id="color" type="color" value="#000000"></label>
+    <label>Size <input id="size" type="range" min="1" max="60" value="4"></label>
+    <button id="clearBtn">Clear</button>
+    <button id="saveBtn">Save</button>
+    <label title="Drop image or click to choose">
+      <button id="imgBtn">Add Image</button>
+      <input id="imgInput" type="file" accept="image/*">
+    </label>
+    <div id="status">Connecting...</div>
+  </div>
+
+  <div id="canvasWrap"><canvas id="c"></canvas></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(function(){
+  // --- Socket setup ---
+  const socket = io(); // will use best available transport (websocket, xhr-polling, etc.)
+  const statusEl = document.getElementById('status');
+
+  socket.on('connect', () => {
+    statusEl.textContent = 'Connected';
+  });
+  socket.on('disconnect', () => {
+    statusEl.textContent = 'Disconnected';
+  });
+
+  // On init: receive full history and replay
+  let historyReceived = false;
+  socket.on('init', (actions) => {
+    // actions: array of actions to replay
+    history = actions.slice();
+    rebuildCanvasFromHistory();
+    historyReceived = true;
+    statusEl.textContent = 'Synchronized';
+  });
+
+  // For incremental updates
+  socket.on('action', (act) => {
+    history.push(act);
+    applyAction(act);
+  });
+
+  // --- Canvas + UI ---
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const wrapper = document.getElementById('canvasWrap');
+
+  // UI elements
+  const penBtn = document.getElementById('penBtn');
+  const pixelEraseBtn = document.getElementById('pixelEraseBtn');
+  const strokeEraseBtn = document.getElementById('strokeEraseBtn');
+  const colorInput = document.getElementById('color');
+  const sizeInput = document.getElementById('size');
+  const clearBtn = document.getElementById('clearBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const imgInput = document.getElementById('imgInput');
+  const imgBtn = document.getElementById('imgBtn');
+
+  // State
+  let tool = 'pen'; // 'pen', 'pixel-eraser', 'stroke-eraser'
+  let drawing = false;
+  let curStroke = null; // for pen strokes
+  let curEraserPath = null; // for stroke-eraser path
+  let history = []; // local copy of action history (replayed in order)
+
+  // Setup canvas sizing (with devicePixelRatio)
+  function fitCanvas() {
+    const w = wrapper.clientWidth || window.innerWidth;
+    const h = wrapper.clientHeight || (window.innerHeight - 56);
+    const ratio = window.devicePixelRatio || 1;
+    // Save current image
+    const tmp = document.createElement('canvas');
+    tmp.width = canvas.width;
+    tmp.height = canvas.height;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(canvas,0,0);
+    canvas.width = Math.max(300, Math.floor(w * ratio));
+    canvas.height = Math.max(200, Math.floor(h * ratio));
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    // restore
+    if (tmp.width && tmp.height) {
+      ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+    } else {
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    }
+  }
+  fitCanvas();
+  window.addEventListener('resize', function(){ setTimeout(fitCanvas, 120); });
+
+  // Utility: convert client coords to canvas coords
+  function toCanvasCoords(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const ratioX = canvas.width / rect.width;
+    const ratioY = canvas.height / rect.height;
+    return { x: (clientX - rect.left) * ratioX, y: (clientY - rect.top) * ratioY };
+  }
+
+  // UI tool toggles
+  function setTool(t){
+    tool = t;
+    penBtn.classList.toggle('active', t==='pen');
+    pixelEraseBtn.classList.toggle('active', t==='pixel-eraser');
+    strokeEraseBtn.classList.toggle('active', t==='stroke-eraser');
+  }
+  penBtn.onclick = ()=> setTool('pen');
+  pixelEraseBtn.onclick = ()=> setTool('pixel-eraser');
+  strokeEraseBtn.onclick = ()=> setTool('stroke-eraser');
+
+  // Apply local drawing styles
+  function applyDrawStyle(localCtx, act) {
+    // act may contain {color, size, tool}
+    localCtx.lineJoin = 'round';
+    localCtx.lineCap = 'round';
+    localCtx.lineWidth = (act && act.size) || parseInt(sizeInput.value,10) || 4;
+    if (act && act.tool === 'pixel-eraser') {
+      localCtx.globalCompositeOperation = 'destination-out';
+      localCtx.strokeStyle = 'rgba(0,0,0,1)';
+    } else {
+      localCtx.globalCompositeOperation = 'source-over';
+      localCtx.strokeStyle = (act && act.color) || colorInput.value || '#000';
+    }
+  }
+
+  // Draw stroke on given context (stroke.path is array of {x,y})
+  function drawStrokeOnCtx(localCtx, stroke) {
+    if (!stroke.path || stroke.path.length===0) return;
+    applyDrawStyle(localCtx, stroke);
+    localCtx.beginPath();
+    localCtx.moveTo(stroke.path[0].x, stroke.path[0].y);
+    for (let i=1;i<stroke.path.length;i++){
+      localCtx.lineTo(stroke.path[i].x, stroke.path[i].y);
+    }
+    localCtx.stroke();
+    localCtx.closePath();
+    localCtx.globalCompositeOperation = 'source-over';
+  }
+
+  // Draw image action
+  function drawImageAction(a){
+    const img = new Image();
+    img.onload = function(){
+      // if coordinates provided, use; else center
+      const x = a.x != null ? a.x : (canvas.width - img.width)/2;
+      const y = a.y != null ? a.y : (canvas.height - img.height)/2;
+      const w = a.w != null ? a.w : img.width;
+      const h = a.h != null ? a.h : img.height;
+      ctx.drawImage(img, x, y, w, h);
+    }
+    img.src = a.data;
+  }
+
+  // Apply a single action (used for incremental updates)
+  function applyAction(act) {
+    if (!act || !act.type) return;
+    if (act.type === 'stroke') {
+      drawStrokeOnCtx(ctx, act);
+      return;
+    }
+    if (act.type === 'erase-pixel') {
+      // same as stroke but tool pixel-eraser
+      drawStrokeOnCtx(ctx, { path: act.path, size: act.size, tool: 'pixel-eraser' });
+      return;
+    }
+    if (act.type === 'image') {
+      drawImageAction(act);
+      return;
+    }
+    if (act.type === 'delete-stroke') {
+      // rebuild entire canvas from history up to now excluding deleted strokes
+      rebuildCanvasFromHistory();
+      return;
+    }
+    if (act.type === 'clear') {
+      ctx.save();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.restore();
+      return;
+    }
+  }
+
+  // Rebuild canvas by replaying history in order, taking deletions into account.
+  function rebuildCanvasFromHistory() {
+    // clear to white
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.restore();
+
+    // Build set of deleted stroke ids
+    const deleted = new Set(history.filter(a=>a.type==='delete-stroke').map(a=>a.targetId));
+    for (let i=0;i<history.length;i++){
+      const a = history[i];
+      if (!a || !a.type) continue;
+      if (a.type === 'stroke') {
+        if (deleted.has(a.id)) continue;
+        drawStrokeOnCtx(ctx, a);
+      } else if (a.type === 'erase-pixel') {
+        // draw pixel erase
+        drawStrokeOnCtx(ctx, { path: a.path, size: a.size, tool: 'pixel-eraser' });
+      } else if (a.type === 'image') {
+        drawImageAction(a);
+      } else if (a.type === 'clear') {
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.restore();
+      }
+    }
+  }
+
+  // Pointer/mouse/touch compatibility: use PointerEvent if available
+  function startPoint(x,y){
+    if (tool === 'pen') {
+      curStroke = { type: 'stroke', id: null, color: colorInput.value, size: parseInt(sizeInput.value,10)||4, path: [{x,y}] };
+      applyDrawStyle(ctx, curStroke);
+      ctx.beginPath();
+      ctx.moveTo(x,y);
+    } else if (tool === 'pixel-eraser') {
+      curStroke = { type: 'erase-pixel', id: null, size: parseInt(sizeInput.value,10)||20, path: [{x,y}], tool: 'pixel-eraser' };
+      applyDrawStyle(ctx, curStroke);
+      ctx.beginPath();
+      ctx.moveTo(x,y);
+    } else if (tool === 'stroke-eraser') {
+      curEraserPath = [{x,y}];
+      // show feedback by drawing a temporary path with destination-out to user
+      ctx.save();
+      applyDrawStyle(ctx, { tool: 'pixel-eraser', size: parseInt(sizeInput.value,10)||20 });
+      ctx.beginPath();
+      ctx.moveTo(x,y);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function movePoint(x,y){
+    if (tool === 'pen' && curStroke) {
+      curStroke.path.push({x,y});
+      ctx.lineTo(x,y);
+      ctx.stroke();
+    } else if (tool === 'pixel-eraser' && curStroke) {
+      curStroke.path.push({x,y});
+      ctx.lineTo(x,y);
+      ctx.stroke();
+    } else if (tool === 'stroke-eraser' && curEraserPath) {
+      curEraserPath.push({x,y});
+      // optional local feedback: draw small transparent circle / path while erasing
+      // we won't alter canvas here (we'll rebuild after server resolves deletions)
+      ctx.save();
+      applyDrawStyle(ctx, { tool:'pixel-eraser', size: parseInt(sizeInput.value,10)||20 });
+      ctx.beginPath();
+      // draw latest segment to give user live feel
+      const p = curEraserPath;
+      if (p.length >= 2) {
+        ctx.moveTo(p[p.length-2].x, p[p.length-2].y);
+        ctx.lineTo(p[p.length-1].x, p[p.length-1].y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  function endPoint(){
+    if (curStroke) {
+      // finalize stroke/erase and send to server
+      curStroke.id = 'c-' + Date.now().toString(36) + '-' + Math.floor(Math.random()*1e6).toString(36);
+      history.push(curStroke);
+      socket.emit('action', curStroke);
+      curStroke = null;
+    }
+    if (curEraserPath) {
+      // send erase-stroke request to server, which will resolve which strokes to delete
+      const req = { type: 'erase-stroke-request', id: 'req-' + Date.now(), path: curEraserPath.slice(), size: parseInt(sizeInput.value,10)||20 };
+      socket.emit('action', req);
+      curEraserPath = null;
+    }
+    drawing = false;
+  }
+
+  // Pointer events
+  if (window.PointerEvent) {
+    canvas.addEventListener('pointerdown', function(e){
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      drawing = true;
+      const p = toCanvasCoords(e.clientX, e.clientY);
+      applyDrawStyle(ctx, null);
+      startPoint(p.x, p.y);
+      canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    canvas.addEventListener('pointermove', function(e){
+      if (!drawing) return;
+      const p = toCanvasCoords(e.clientX, e.clientY);
+      movePoint(p.x, p.y);
+      e.preventDefault();
+    });
+    canvas.addEventListener('pointerup', function(e){
+      endPoint();
+      e.preventDefault();
+    });
+    canvas.addEventListener('pointercancel', function(e){
+      endPoint();
+    });
+  } else {
+    // mouse
+    canvas.addEventListener('mousedown', function(e){
+      if (e.button !== 0) return;
+      drawing = true;
+      const p = toCanvasCoords(e.clientX, e.clientY);
+      startPoint(p.x, p.y);
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', function(e){
+      if (!drawing) return;
+      const p = toCanvasCoords(e.clientX, e.clientY);
+      movePoint(p.x, p.y);
+      e.preventDefault();
+    });
+    document.addEventListener('mouseup', function(e){
+      if (!drawing) return;
+      endPoint();
+      e.preventDefault();
+    });
+
+    // touch
+    canvas.addEventListener('touchstart', function(e){
+      const t = e.changedTouches[0]; if(!t) return;
+      drawing = true;
+      const p = toCanvasCoords(t.clientX, t.clientY);
+      startPoint(p.x, p.y);
+      e.preventDefault();
+    }, { passive:false });
+    canvas.addEventListener('touchmove', function(e){
+      const t = e.changedTouches[0]; if(!t) return;
+      const p = toCanvasCoords(t.clientX, t.clientY);
+      movePoint(p.x, p.y);
+      e.preventDefault();
+    }, { passive:false });
+    canvas.addEventListener('touchend', function(e){
+      endPoint();
+      e.preventDefault();
+    }, { passive:false });
+  }
+
+  // Clear button
+  clearBtn.onclick = function(){
+    // clear locally
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.restore();
+    // push clear action
+    const a = { type: 'clear', id: 'clear-' + Date.now() };
+    history.push(a);
+    socket.emit('action', a);
+  };
+
+  // Save button
+  saveBtn.onclick = function(){
+    try {
+      const data = canvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = data;
+      a.download = 'drawing.png';
+      if (typeof a.click === 'function') a.click();
+      else window.open(data, '_blank');
+    } catch (e) {
+      alert('Save not supported');
+    }
+  };
+
+  // Image input
+  imgInput.addEventListener('change', function(e){
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = function(ev){
+      const data = ev.target.result;
+      // Draw locally centered at canvas center with scaling if large
+      const img = new Image();
+      img.onload = function(){
+        const maxW = canvas.width * 0.8;
+        const maxH = canvas.height * 0.8;
+        let w = img.width, h = img.height;
+        const ratio = Math.min(1, Math.min(maxW / w, maxH / h));
+        w = Math.floor(w * ratio); h = Math.floor(h * ratio);
+        const x = (canvas.width - w)/2;
+        const y = (canvas.height - h)/2;
+        // action
+        const act = { type: 'image', id: 'img-' + Date.now(), data, x, y, w, h };
+        history.push(act);
+        socket.emit('action', act);
+        // will be drawn when server broadcasts (or we can draw immediately)
+        drawImageAction(act);
+      };
+      img.src = data;
+    };
+    reader.readAsDataURL(f);
+    // reset input
+    e.target.value = '';
+  });
+
+  // Clicking image button opens file chooser
+  imgBtn.addEventListener('click', function(){ imgInput.click(); });
+
+  // Drag & drop image support
+  window.addEventListener('dragover', function(e){ e.preventDefault(); }, false);
+  window.addEventListener('drop', function(e){
+    e.preventDefault();
+    const dt = e.dataTransfer;
+    if (!dt) return;
+    const file = dt.files && dt.files[0];
+    if (file && file.type && file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = function(ev){
+        const data = ev.target.result;
+        const img = new Image();
+        img.onload = function(){
+          const maxW = canvas.width * 0.8;
+          const maxH = canvas.height * 0.8;
+          let w = img.width, h = img.height;
+          const ratio = Math.min(1, Math.min(maxW / w, maxH / h));
+          w = Math.floor(w * ratio); h = Math.floor(h * ratio);
+          const x = (canvas.width - w)/2;
+          const y = (canvas.height - h)/2;
+          const act = { type: 'image', id: 'img-' + Date.now(), data, x, y, w, h };
+          history.push(act);
+          socket.emit('action', act);
+          drawImageAction(act);
+        };
+        img.src = data;
+      };
+      reader.readAsDataURL(file);
+    }
+  }, false);
+
+  // Utility to draw image action locally (same as earlier)
+  function drawImageAction(a){
+    const img = new Image();
+    img.onload = function(){
+      const x = a.x != null ? a.x : (canvas.width - img.width)/2;
+      const y = a.y != null ? a.y : (canvas.height - img.height)/2;
+      const w = a.w != null ? a.w : img.width;
+      const h = a.h != null ? a.h : img.height;
+      ctx.drawImage(img, x, y, w, h);
+    }
+    img.src = a.data;
+  }
+
+  // On manual reload, if no init arrives (server slow), we may still receive incremental actions.
+  // Keep status helpful:
+  setTimeout(() => { if (!historyReceived) statusEl.textContent = 'Connected — waiting for history...'; }, 1200);
+
+})();
+</script>
+</body>
+</html>
